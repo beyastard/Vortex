@@ -110,6 +110,43 @@ def main():
         check("xformers", xformers.__version__)
     except ImportError:
         check("xformers", "NOT FOUND (optional, not required)")
+    
+    # Vortex model import
+    section("Vortex Model")
+    try:
+        repo_root = os.path.join(os.path.dirname(__file__), "..", "..")
+        sys.path.insert(0, repo_root)
+        from model.vortex import VortexConfig, VortexForCausalLM
+        config = VortexConfig(d_model=64, n_layer=2, d_state=16, n_heads=2, vocab_size=256)
+        model = VortexForCausalLM(config)
+        params = sum(p.numel() for p in set(model.parameters()))
+        check("model.vortex import",      "OK")
+        check("Tiny model instantiation", f"OK ({params:,} params)")
+
+        # Quick forward pass
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device)
+            x = torch.randint(0, 256, (1, 16)).to(device)
+            with torch.no_grad():
+                out = model(input_ids=x)
+            check("Forward pass", f"OK  logits={tuple(out.logits.shape)}")
+        except Exception as e:
+            check("Forward pass", f"FAIL: {e}", ok=False)
+
+    except Exception as e:
+        check("Vortex import/test", f"FAIL: {e}", ok=False)
+
+    # Summary
+    section("Summary")
+    import torch as _torch
+    if _torch.cuda.is_available():
+        free_gb = _torch.cuda.mem_get_info(0)[0] / 1e9
+        rec_size = "medium" if free_gb >= 5.0 else "small"
+        print(f"  Recommended model size for your GPU: --size {rec_size}")
+        print(f"  Recommended batch_size:              4–8  (with grad_accum 4–8)")
+    print()
 
 
 if __name__ == "__main__":
