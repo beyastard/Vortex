@@ -6,6 +6,9 @@ Hardware and environment diagnostics for Vortex.
 Checks Python, PyTorch, CUDA, Triton, Flash Attention, and available VRAM.
 Run this first to verify your environment is correctly set up.
 
+Author: Bryan K Reinhart
+License: AGPL-3.0
+
 Usage
 -----
     python scripts/tools/diag.py
