@@ -118,6 +118,103 @@ class CausalDepthwiseConv1d(nn.Module):
 # Pure-PyTorch selective scan (SSD core)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def selective_scan_pure2(
+    u, delta, A, B, C, D,
+    delta_bias=None, delta_softplus=True,
+):
+    """
+    Parallel associative scan — O(log L) depth instead of O(L) sequential.
+    Runs entirely in vectorised PyTorch ops with no Python loop over tokens.
+    """
+    dtype_in = u.dtype
+    u     = u.float()
+    delta = delta.float()
+
+    if delta_bias is not None:
+        delta = delta + delta_bias.unsqueeze(0).unsqueeze(0)
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    B_seq = B.float()   # (batch, L, d_state)
+    C_seq = C.float()   # (batch, L, d_state)
+    batch, L, d_inner = u.shape
+    d_state = A.shape[1]
+
+    # Discretise
+    # deltaA: (batch, L, d_inner, d_state)
+    # deltaB_u: (batch, L, d_inner, d_state)
+    deltaA   = torch.exp(
+        delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+    )
+    deltaB_u = (
+        delta.unsqueeze(-1)
+        * B_seq.unsqueeze(2)
+        * u.unsqueeze(-1)
+    )
+
+    # Parallel associative scan
+    # We represent the state at each position as (a_i, b_i) where:
+    #   h_i = a_i * h_{i-1} + b_i
+    # The associative combination is:
+    #   (a_j, b_j) ∘ (a_i, b_i) = (a_j * a_i, a_j * b_i + b_j)
+    # This lets us compute all h_i in parallel in O(log L) steps.
+
+    log2_L = math.ceil(math.log2(max(L, 1)))
+
+    # Pad L to next power of 2 for the binary tree reduction
+    L_pad = 2 ** log2_L
+    pad   = L_pad - L
+
+    # a: (batch, L_pad, d_inner, d_state)
+    # b: (batch, L_pad, d_inner, d_state)
+    if pad > 0:
+        a = F.pad(deltaA,   (0, 0, 0, 0, 0, pad))
+        b = F.pad(deltaB_u, (0, 0, 0, 0, 0, pad))
+    else:
+        a = deltaA
+        b = deltaB_u
+
+    # Up-sweep (reduce)
+    for d in range(log2_L):
+        stride = 2 ** (d + 1)
+        left   = torch.arange(0,      L_pad, stride, device=u.device)
+        right  = torch.arange(stride//2, L_pad, stride, device=u.device)
+        if len(right) == 0:
+            break
+        a_right = a[:, right]
+        b_right = b[:, right]
+        a_left  = a[:, left[:len(right)]]
+        b_left  = b[:, left[:len(right)]]
+        a[:, right] = a_right * a_left
+        b[:, right] = a_right * b_left + b_right
+
+    # Down-sweep (scan)
+    a[:, -1] = 0.0
+    b[:, -1] = 0.0
+    for d in range(log2_L - 1, -1, -1):
+        stride = 2 ** (d + 1)
+        left   = torch.arange(0,        L_pad, stride, device=u.device)
+        right  = torch.arange(stride//2, L_pad, stride, device=u.device)
+        if len(right) == 0:
+            break
+        t_a             = a[:, left[:len(right)]].clone()
+        t_b             = b[:, left[:len(right)]].clone()
+        a[:, left[:len(right)]] = a[:, right]
+        b[:, left[:len(right)]] = b[:, right]
+        a[:, right] = a[:, right] * t_a
+        b[:, right] = a[:, right] * t_b + b[:, right]
+
+    # h contains the prefix-scan results: h_i = sum_{j<=i} (prod_{k>j}^i a_k) * b_j
+    # Trim padding
+    h = b[:, :L]   # (batch, L, d_inner, d_state)
+
+    # Output: y_t = C_t · h_t + D · u_t
+    # C_seq: (batch, L, d_state) -> (batch, L, 1, d_state)
+    y = (h * C_seq.unsqueeze(2)).sum(dim=-1)   # (batch, L, d_inner)
+    y = y + u * D.unsqueeze(0).unsqueeze(0)
+
+    return y.to(dtype_in)
+
 def selective_scan_pure(
     u: torch.Tensor,      # (B, L, d_inner)
     delta: torch.Tensor,  # (B, L, d_inner)
@@ -174,6 +271,108 @@ def selective_scan_pure(
 # ──────────────────────────────────────────────────────────────────────────────
 # Triton selective scan (loaded lazily)
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _build_triton_selective_scan2():
+    """
+    Triton-accelerated parallel prefix scan using the associative scan algorithm.
+    Each Triton kernel handles one (batch, d_inner, d_state) lane across the
+    sequence in parallel — no Python loop over tokens.
+    """
+    if not _TRITON_AVAILABLE:
+        return None
+
+    try:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _parallel_scan_kernel(
+            a_ptr, b_ptr, out_ptr,
+            L, d_inner, d_state,
+            stride_bl, stride_bd, stride_bs,
+            BLOCK_L: tl.constexpr,
+        ):
+            """
+            One program instance per (batch * d_inner * d_state) lane.
+            Processes BLOCK_L tokens per instance using a work-efficient
+            parallel scan within the block.
+            """
+            pid    = tl.program_id(0)
+            n_lane = d_inner * d_state
+            bid    = pid // n_lane
+            lid    = pid  % n_lane
+            did    = lid  // d_state
+            sid    = lid  % d_state
+
+            offsets = tl.arange(0, BLOCK_L)
+            mask    = offsets < L
+
+            base = bid * stride_bl * L + did * stride_bd + sid * stride_bs
+
+            a_vals = tl.load(a_ptr + base + offsets * stride_bl,
+                             mask=mask, other=1.0).to(tl.float32)
+            b_vals = tl.load(b_ptr + base + offsets * stride_bl,
+                             mask=mask, other=0.0).to(tl.float32)
+
+            # Sequential scan within the block (fast in SRAM)
+            h = 0.0
+            for i in tl.static_range(BLOCK_L):
+                active = i < L
+                h = tl.where(active, a_vals[i] * h + b_vals[i], h)
+                tl.store(out_ptr + base + i * stride_bl, h,
+                         mask=(i < L))
+
+        def selective_scan_triton(u, delta, A, B, C, D,
+                                   delta_bias=None, delta_softplus=True):
+            dtype_in = u.dtype
+            u     = u.float()
+            delta = delta.float()
+
+            if delta_bias is not None:
+                delta = delta + delta_bias.unsqueeze(0).unsqueeze(0)
+            if delta_softplus:
+                delta = F.softplus(delta)
+
+            batch, L, d_inner = u.shape
+            d_state = A.shape[1]
+
+            deltaA   = torch.exp(
+                delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+            )
+            deltaB_u = (
+                delta.unsqueeze(-1)
+                * B.float().unsqueeze(2)
+                * u.unsqueeze(-1)
+            )
+
+            # Layout: (batch, L, d_inner, d_state) — contiguous
+            a = deltaA.contiguous()
+            b = deltaB_u.contiguous()
+            h = torch.zeros_like(b)
+
+            stride_bl = a.stride(1)
+            stride_bd = a.stride(2)
+            stride_bs = a.stride(3)
+
+            BLOCK_L   = triton.next_power_of_2(L)
+            n_programs = batch * d_inner * d_state
+
+            _parallel_scan_kernel[(n_programs,)](
+                a, b, h,
+                L, d_inner, d_state,
+                stride_bl, stride_bd, stride_bs,
+                BLOCK_L=BLOCK_L,
+            )
+
+            y = (h * C.float().unsqueeze(2)).sum(dim=-1)
+            y = y + u * D.unsqueeze(0).unsqueeze(0)
+            return y.to(dtype_in)
+
+        return selective_scan_triton
+
+    except Exception as e:
+        logger.warning(f"Triton parallel scan build failed ({e}), using pure-PyTorch.")
+        return None
 
 def _build_triton_selective_scan():
     """
@@ -521,7 +720,9 @@ class VortexForCausalLM(PreTrainedModel):
     config_class = VortexConfig
     base_model_prefix = "vortex"
     supports_gradient_checkpointing = True
-    _tied_weights_keys = ["lm_head.weight"]
+    # tied weights now handled manually
+    #_tied_weights_keys = ["lm_head.weight", "vortex.embedding.weight"]  # ← BOTH keys
+    #_tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: VortexConfig):
         super().__init__(config)
@@ -547,6 +748,21 @@ class VortexForCausalLM(PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+    
+    def tie_weights(self, **kwargs):
+        if self.config.tie_embeddings:
+            self.lm_head.weight = self.vortex.embedding.weight
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        # Use strict=False so missing lm_head.weight (tied, not saved) doesn't error
+        kwargs.setdefault("ignore_mismatched_sizes", False)
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        
+        # Re-tie after load
+        if model.config.tie_embeddings:
+            model.lm_head.weight = model.vortex.embedding.weight
+        return model
 
     def forward(
         self,
