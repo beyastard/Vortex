@@ -113,8 +113,6 @@ Dataset-specific presets (use --preset instead of --field_map):
   alpaca            tatsu-lab/alpaca style             (instruction+input+output)
   dolly             databricks/databricks-dolly-15k    (instruction+context+response)
 
-Author: Bryan K Reinhart
-License: AGPL-3.0
 """
 
 from __future__ import annotations

@@ -37,6 +37,17 @@ from model.vortex import VortexConfig, VortexForCausalLM
 # ── Size presets ───────────────────────────────────────────────────────────────
 
 PRESETS = {
+    "nano": dict(
+        d_model=224,
+        n_layer=4,
+        d_state=32,
+        expand=2,
+        n_heads=4,
+        dt_rank="auto",
+        num_loops=2,
+        block_size=1024,
+        vocab_size=32000,
+    ),
     "small": dict(
         d_model=384,
         n_layer=6,
@@ -59,6 +70,17 @@ PRESETS = {
         block_size=1024,
         vocab_size=32000,
     ),
+    "large": dict(
+        d_model=768,
+        n_layer=12,
+        d_state=96,
+        expand=2,
+        n_heads=12,
+        dt_rank="auto",
+        num_loops=2,
+        block_size=2048,
+        vocab_size=32000,
+    ),
 }
 
 
@@ -66,15 +88,15 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Initialize a blank Vortex model and save to disk."
     )
-    p.add_argument("--output", default="checkpoints/vortex_v1",
+    p.add_argument("--output", default="checkpoints/vortex_v1_small",
                    help="Output directory for model files.")
-    p.add_argument("--size", choices=["small", "medium", "custom"], default="medium",
+    p.add_argument("--size", choices=["nano", "small", "medium", "large", "custom"], default="small",
                    help="Model size preset, or 'custom' to specify dimensions manually.")
-    p.add_argument("--d_model",   type=int,   default=512)
-    p.add_argument("--n_layer",   type=int,   default=8)
-    p.add_argument("--d_state",   type=int,   default=64)
+    p.add_argument("--d_model",   type=int,   default=384)
+    p.add_argument("--n_layer",   type=int,   default=6)
+    p.add_argument("--d_state",   type=int,   default=48)
     p.add_argument("--expand",    type=int,   default=2)
-    p.add_argument("--n_heads",   type=int,   default=8)
+    p.add_argument("--n_heads",   type=int,   default=6)
     p.add_argument("--num_loops", type=int,   default=2)
     p.add_argument("--block_size",type=int,   default=1024)
     p.add_argument("--vocab_size",type=int,   default=32000)

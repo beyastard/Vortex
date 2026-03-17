@@ -75,12 +75,12 @@ def parse_args():
                    help="Path to checkpoint directory to resume from.")
 
     # Model (ignored if resuming)
-    p.add_argument("--model_size",  default="medium", choices=["small", "medium", "custom"])
-    p.add_argument("--d_model",     type=int, default=512)
-    p.add_argument("--n_layer",     type=int, default=8)
-    p.add_argument("--d_state",     type=int, default=64)
+    p.add_argument("--model_size",  default="medium", choices=["nano", "small", "medium", "large", "custom"])
+    p.add_argument("--d_model",     type=int, default=384)
+    p.add_argument("--n_layer",     type=int, default=6)
+    p.add_argument("--d_state",     type=int, default=48)
     p.add_argument("--expand",      type=int, default=2)
-    p.add_argument("--n_heads",     type=int, default=8)
+    p.add_argument("--n_heads",     type=int, default=6)
     p.add_argument("--num_loops",   type=int, default=2)
     p.add_argument("--block_size",  type=int, default=1024)
     p.add_argument("--vocab_size",  type=int, default=32000)
@@ -169,8 +169,10 @@ def get_lr(step: int, warmup_steps: int, max_steps: int,
 # ──────────────────────────────────────────────────────────────────────────────
 
 SIZE_PRESETS = {
-    "small":  dict(d_model=384, n_layer=6, d_state=48, expand=2, n_heads=6),
-    "medium": dict(d_model=512, n_layer=8, d_state=64, expand=2, n_heads=8),
+    "nano":   dict(d_model=224,  n_layer=4, d_state=32, expand=2,  n_heads=4),
+    "small":  dict(d_model=384,  n_layer=6, d_state=48, expand=2,  n_heads=6),
+    "medium": dict(d_model=512,  n_layer=8, d_state=64, expand=2,  n_heads=8),
+    "large":  dict(d_model=768, n_layer=12, d_state=96, expand=2, n_heads=12),
 }
 
 def build_model(args) -> VortexForCausalLM:
